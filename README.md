@@ -10,7 +10,7 @@ Serve this directory with any static web server, then open it in a modern browse
 
 - Buildless HTML/CSS/JavaScript for a clean GitHub backup path.
 - Canvas preview and real-time MediaRecorder export at 25 fps.
-- Low-resolution luminance proxy for stabilization analysis.
+- OpenCV.js pyramidal optical flow, forward/backward validation, and RANSAC similarity transforms for local stabilization analysis.
 - Service worker and web app manifest for PWA installability.
 
 The browser must be able to decode the selected MP4/MOV. Export uses the first MediaRecorder format supported by the current browser; this can be MP4 on Safari or WebM on Chromium browsers.

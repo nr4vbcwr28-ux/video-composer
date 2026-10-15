@@ -146,13 +146,18 @@
     const w = cw, h = w / ratio; return { x: 0, y: (ch - h) / 2, w, h };
   }
   function correctionAt(time) {
-    if (state.mode === 'off' || !state.corrections.length) return { x: 0, y: 0 };
+    if (state.mode === 'off' || !state.corrections.length) return { x: 0, y: 0, angle: 0, scale: 1 };
     let right = state.corrections.findIndex(item => item.t >= time);
     if (right <= 0) return state.corrections[Math.max(0, right)] || { x: 0, y: 0 };
     if (right < 0) return state.corrections[state.corrections.length - 1];
     const a = state.corrections[right - 1], b = state.corrections[right];
     const mix = (time - a.t) / Math.max(.001, b.t - a.t);
-    return { x: a.x + (b.x - a.x) * mix, y: a.y + (b.y - a.y) * mix };
+    return {
+      x: a.x + (b.x - a.x) * mix,
+      y: a.y + (b.y - a.y) * mix,
+      angle: (a.angle || 0) + ((b.angle || 0) - (a.angle || 0)) * mix,
+      scale: (a.scale || 1) + ((b.scale || 1) - (a.scale || 1)) * mix
+    };
   }
   function drawFrame(target, targetRatio = currentRatio()) {
     if (!state.file || video.readyState < 2) return;
@@ -172,9 +177,14 @@
     const cropY = state.offsetY * maxY;
     const stabilizeX = motion.x * drawW;
     const stabilizeY = motion.y * drawH;
-    const dx = view.x + (view.w - drawW) / 2 + cropX + stabilizeX;
-    const dy = view.y + (view.h - drawH) / 2 + cropY + stabilizeY;
-    c.drawImage(video, dx, dy, drawW, drawH);
+    const centerX = view.x + view.w / 2 + cropX + stabilizeX;
+    const centerY = view.y + view.h / 2 + cropY + stabilizeY;
+    c.save();
+    c.translate(centerX, centerY);
+    c.rotate(motion.angle || 0);
+    c.scale(motion.scale || 1, motion.scale || 1);
+    c.drawImage(video, -drawW / 2, -drawH / 2, drawW, drawH);
+    c.restore();
     if (state.text.trim()) {
       const scale = view.w / 1080;
       const fontSize = Math.max(12, state.textSize * scale);
@@ -197,143 +207,176 @@
   }
   function updateTimeDisplay() { $('#timeDisplay').textContent = `${formatTime(video.currentTime)} / ${formatTime(state.trimEnd)}`; $('#scrubber').value = Math.min(state.trimEnd, Math.max(state.trimStart, video.currentTime || 0)); }
 
-  function edgeMap(data, width, height) {
-    const gray = new Uint8Array(width * height);
-    const edges = new Uint8Array(width * height);
-    for (let i = 0, p = 0; i < data.length; i += 4, p++) gray[p] = Math.round(data[i] * .2126 + data[i + 1] * .7152 + data[i + 2] * .0722);
-    for (let y = 1; y < height; y++) for (let x = 1; x < width; x++) {
-      const i = y * width + x;
-      edges[i] = Math.min(255, Math.abs(gray[i] - gray[i - 1]) + Math.abs(gray[i] - gray[i - width]));
-    }
-    return edges;
+  let openCvPromise;
+  function loadOpenCV() {
+    if (window.cv && window.cv.Mat) return Promise.resolve(window.cv);
+    if (openCvPromise) return openCvPromise;
+    openCvPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = './opencv.js'; script.async = true;
+      script.onerror = () => reject(new Error('OpenCV could not load.'));
+      script.onload = () => {
+        if (!window.cv) return reject(new Error('OpenCV did not initialize.'));
+        if (window.cv.Mat) return resolve(window.cv);
+        if (typeof window.cv.then === 'function') return window.cv.then(resolve);
+        window.cv.onRuntimeInitialized = () => resolve(window.cv);
+      };
+      document.head.append(script);
+    });
+    return openCvPromise;
   }
 
-  function median(values) {
-    const sorted = [...values].sort((a, b) => a - b);
-    const middle = Math.floor(sorted.length / 2);
-    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
-  }
-
-  function trackingPoints(edges, width, height, radius, maxPoints = 16) {
-    const patchRadius = 4, margin = radius + patchRadius + 2, candidates = [];
-    for (let y = margin; y < height - margin; y += 7) for (let x = margin; x < width - margin; x += 7) {
-      let score = 0;
-      for (let py = -2; py <= 2; py++) for (let px = -2; px <= 2; px++) score += edges[(y + py) * width + x + px];
-      if (score > 420) candidates.push({ x, y, score });
-    }
-    candidates.sort((a, b) => b.score - a.score);
-    const selected = [];
-    for (const point of candidates) {
-      if (selected.every(other => Math.hypot(point.x - other.x, point.y - other.y) >= 9)) selected.push(point);
-      if (selected.length >= maxPoints) break;
-    }
-    return selected;
-  }
-
-  function matchPoint(previous, current, width, point, radius) {
-    const patchRadius = 4;
-    let bestScore = Infinity, bestX = 0, bestY = 0, zeroScore = Infinity;
-    const scoreAt = (dx, dy) => {
-      let difference = 0;
-      for (let py = -patchRadius; py <= patchRadius; py += 2) {
-        const previousRow = (point.y + py) * width;
-        const currentRow = (point.y + dy + py) * width;
-        for (let px = -patchRadius; px <= patchRadius; px += 2) {
-          difference += Math.abs(previous[previousRow + point.x + px] - current[currentRow + point.x + dx + px]);
-        }
-      }
-      return difference;
-    };
-    zeroScore = scoreAt(0, 0);
-    for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
-      const difference = scoreAt(dx, dy);
-      if (difference < bestScore) { bestScore = difference; bestX = dx; bestY = dy; }
-    }
-    const confidence = zeroScore > 0 ? Math.max(0, (zeroScore - bestScore) / zeroScore) : 0;
-    return { x: bestX, y: bestY, confidence };
-  }
-
-  function estimateTranslation(previous, current, width, height, radius = 12) {
-    const points = trackingPoints(previous, width, height, radius);
-    const matches = points.map(point => matchPoint(previous, current, width, point, radius))
-      .filter(match => match.confidence >= .018 || Math.hypot(match.x, match.y) <= 1.5);
-    if (matches.length < 5) return { x: 0, y: 0, confidence: 0, tracks: matches.length };
-    const centerX = median(matches.map(match => match.x));
-    const centerY = median(matches.map(match => match.y));
-    const deviations = matches.map(match => Math.hypot(match.x - centerX, match.y - centerY));
-    const tolerance = Math.max(1.5, median(deviations) * 2.5);
-    const inliers = matches.filter(match => Math.hypot(match.x - centerX, match.y - centerY) <= tolerance);
-    if (inliers.length < 4) return { x: 0, y: 0, confidence: 0, tracks: inliers.length };
+  function identitySimilarity() { return { a: 1, b: 0, tx: 0, ty: 0 }; }
+  function composeSimilarity(next, previous) {
     return {
-      x: median(inliers.map(match => match.x)),
-      y: median(inliers.map(match => match.y)),
-      confidence: median(inliers.map(match => match.confidence)),
-      tracks: inliers.length
+      a: next.a * previous.a - next.b * previous.b,
+      b: next.b * previous.a + next.a * previous.b,
+      tx: next.a * previous.tx - next.b * previous.ty + next.tx,
+      ty: next.b * previous.tx + next.a * previous.ty + next.ty
     };
   }
-
-  function smoothPath(path, index, radius) {
-    let x = 0, y = 0, weightTotal = 0;
-    for (let i = Math.max(0, index - radius); i <= Math.min(path.length - 1, index + radius); i++) {
-      const distance = Math.abs(i - index);
-      const weight = radius + 1 - distance;
-      x += path[i].x * weight; y += path[i].y * weight; weightTotal += weight;
+  function similarityFromPair(one, two) {
+    const px = two.px - one.px, py = two.py - one.py;
+    const qx = two.qx - one.qx, qy = two.qy - one.qy;
+    const denominator = px * px + py * py;
+    if (denominator < 64) return null;
+    const a = (px * qx + py * qy) / denominator;
+    const b = (px * qy - py * qx) / denominator;
+    return { a, b, tx: one.qx - a * one.px + b * one.py, ty: one.qy - b * one.px - a * one.py };
+  }
+  function refineSimilarity(matches) {
+    if (matches.length < 2) return null;
+    const count = matches.length;
+    const center = matches.reduce((sum, item) => ({ px: sum.px + item.px, py: sum.py + item.py, qx: sum.qx + item.qx, qy: sum.qy + item.qy }), { px: 0, py: 0, qx: 0, qy: 0 });
+    Object.keys(center).forEach(key => { center[key] /= count; });
+    let numeratorA = 0, numeratorB = 0, denominator = 0;
+    for (const item of matches) {
+      const px = item.px - center.px, py = item.py - center.py;
+      const qx = item.qx - center.qx, qy = item.qy - center.qy;
+      numeratorA += px * qx + py * qy;
+      numeratorB += px * qy - py * qx;
+      denominator += px * px + py * py;
     }
-    return { x: x / weightTotal, y: y / weightTotal };
+    if (denominator < 1) return null;
+    const a = numeratorA / denominator, b = numeratorB / denominator;
+    return { a, b, tx: center.qx - a * center.px + b * center.py, ty: center.qy - b * center.px - a * center.py };
+  }
+  function estimateSimilarityRansac(matches) {
+    if (matches.length < 8) return null;
+    let best = [], seed = matches.length * 2654435761;
+    for (let attempt = 0; attempt < Math.min(140, matches.length * 6); attempt++) {
+      seed = (seed * 1664525 + 1013904223) >>> 0; const first = seed % matches.length;
+      seed = (seed * 1664525 + 1013904223) >>> 0; const second = seed % matches.length;
+      if (first === second) continue;
+      const model = similarityFromPair(matches[first], matches[second]);
+      if (!model) continue;
+      const inliers = matches.filter(item => {
+        const x = model.a * item.px - model.b * item.py + model.tx;
+        const y = model.b * item.px + model.a * item.py + model.ty;
+        return Math.hypot(x - item.qx, y - item.qy) <= 2.4;
+      });
+      if (inliers.length > best.length) best = inliers;
+    }
+    if (best.length < Math.max(7, matches.length * .35)) return null;
+    const model = refineSimilarity(best);
+    if (!model) return null;
+    const scale = Math.hypot(model.a, model.b), angle = Math.atan2(model.b, model.a);
+    if (scale < .92 || scale > 1.08 || Math.abs(angle) > .12) return null;
+    return { ...model, inliers: best.length };
+  }
+  function poseComponents(transform, width, height, time) {
+    const cx = width / 2, cy = height / 2;
+    const movedX = transform.a * cx - transform.b * cy + transform.tx;
+    const movedY = transform.b * cx + transform.a * cy + transform.ty;
+    return {
+      t: time,
+      x: (movedX - cx) / width,
+      y: (movedY - cy) / height,
+      angle: Math.atan2(transform.b, transform.a),
+      logScale: Math.log(Math.max(.001, Math.hypot(transform.a, transform.b)))
+    };
+  }
+  function smoothPath(path, index, radius) {
+    let x = 0, y = 0, angle = 0, logScale = 0, weightTotal = 0;
+    for (let i = Math.max(0, index - radius); i <= Math.min(path.length - 1, index + radius); i++) {
+      const distance = Math.abs(i - index), weight = radius + 1 - distance;
+      x += path[i].x * weight; y += path[i].y * weight; angle += path[i].angle * weight; logScale += path[i].logScale * weight; weightTotal += weight;
+    }
+    return { x: x / weightTotal, y: y / weightTotal, angle: angle / weightTotal, logScale: logScale / weightTotal };
+  }
+  function opticalFlowMatches(cv, previous, current) {
+    const points = new cv.Mat(), next = new cv.Mat(), back = new cv.Mat();
+    const status = new cv.Mat(), errors = new cv.Mat(), backStatus = new cv.Mat(), backErrors = new cv.Mat(), mask = new cv.Mat();
+    try {
+      cv.goodFeaturesToTrack(previous, points, 180, .01, 8, mask, 7, false, .04);
+      if (points.rows < 8) return [];
+      const windowSize = new cv.Size(21, 21);
+      const criteria = new cv.TermCriteria(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, .01);
+      cv.calcOpticalFlowPyrLK(previous, current, points, next, status, errors, windowSize, 3, criteria);
+      cv.calcOpticalFlowPyrLK(current, previous, next, back, backStatus, backErrors, windowSize, 3, criteria);
+      const matches = [];
+      for (let i = 0; i < points.rows; i++) {
+        if (!status.data[i] || !backStatus.data[i] || errors.data32F[i] > 35) continue;
+        const px = points.data32F[i * 2], py = points.data32F[i * 2 + 1];
+        const qx = next.data32F[i * 2], qy = next.data32F[i * 2 + 1];
+        const bx = back.data32F[i * 2], by = back.data32F[i * 2 + 1];
+        if (Math.hypot(px - bx, py - by) <= 1.6) matches.push({ px, py, qx, qy });
+      }
+      return matches;
+    } finally { points.delete(); next.delete(); back.delete(); status.delete(); errors.delete(); backStatus.delete(); backErrors.delete(); mask.delete(); }
   }
 
   async function analyzeMotion() {
     if (!state.file || state.mode === 'off') return;
     const button = $('#analyzeButton'), progress = $('#analysisProgress');
-    button.disabled = true; button.textContent = 'Analyzing motion…'; progress.classList.remove('hidden'); video.pause();
-    const proxy = document.createElement('canvas'); proxy.width = 192; proxy.height = Math.max(108, Math.round(192 * video.videoHeight / video.videoWidth));
-    const pctx = proxy.getContext('2d', { willReadFrequently: true });
-    const length = state.trimEnd - state.trimStart;
-    const count = Math.max(12, Math.min(240, Math.ceil(length * 5) + 1));
-    const frames = [];
+    button.disabled = true; button.textContent = 'Loading optical-flow engine…'; progress.classList.remove('hidden'); video.pause();
+    let previousGray = null;
     try {
+      const cv = await loadOpenCV();
+      const proxy = document.createElement('canvas'); proxy.width = 320; proxy.height = Math.max(180, Math.round(320 * video.videoHeight / video.videoWidth));
+      const pctx = proxy.getContext('2d', { willReadFrequently: true });
+      const length = state.trimEnd - state.trimStart;
+      const count = Math.max(16, Math.min(360, Math.ceil(length * 6) + 1));
+      const path = [], identity = identitySimilarity(); let pose = identity, trackedSamples = 0, inlierTotal = 0;
       for (let i = 0; i < count; i++) {
-        const t = state.trimStart + (length * i / Math.max(1, count - 1));
+        const t = state.trimStart + length * i / Math.max(1, count - 1);
         await seek(t); pctx.drawImage(video, 0, 0, proxy.width, proxy.height);
-        const edges = edgeMap(pctx.getImageData(0, 0, proxy.width, proxy.height).data, proxy.width, proxy.height);
-        frames.push({ t, edges });
-        button.textContent = `Analyzing motion… ${Math.round((i + 1) / count * 100)}%`;
+        const rgba = cv.matFromImageData(pctx.getImageData(0, 0, proxy.width, proxy.height));
+        const gray = new cv.Mat(); cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY); rgba.delete();
+        if (previousGray) {
+          const matches = opticalFlowMatches(cv, previousGray, gray);
+          const motion = estimateSimilarityRansac(matches);
+          if (motion) {
+            const centerMotion = poseComponents(motion, proxy.width, proxy.height, t);
+            if (Math.hypot(centerMotion.x, centerMotion.y) < .14) { pose = composeSimilarity(motion, pose); trackedSamples++; inlierTotal += motion.inliers; }
+          }
+          previousGray.delete();
+        }
+        previousGray = gray;
+        path.push(poseComponents(pose, proxy.width, proxy.height, t));
+        button.textContent = `Optical-flow analysis… ${Math.round((i + 1) / count * 100)}%`;
         await wait(0);
       }
-      let trackedSamples = 0;
-      const path = [{ t: frames[0].t, x: 0, y: 0 }];
-      if (state.mode === 'lock') {
-        let lastGood = { x: 0, y: 0 };
-        for (let i = 1; i < frames.length; i++) {
-          const motion = estimateTranslation(frames[0].edges, frames[i].edges, proxy.width, proxy.height, 26);
-          if (motion.tracks >= 5 && (motion.confidence >= .01 || Math.hypot(motion.x, motion.y) <= 1.5)) {
-            lastGood = { x: motion.x / proxy.width, y: motion.y / proxy.height };
-            trackedSamples++;
-          }
-          path.push({ t: frames[i].t, ...lastGood });
-        }
-      } else {
-        for (let i = 1; i < frames.length; i++) {
-          const motion = estimateTranslation(frames[i - 1].edges, frames[i].edges, proxy.width, proxy.height, 12);
-          const accepted = motion.tracks >= 5 && (motion.confidence >= .01 || Math.hypot(motion.x, motion.y) <= 1.5);
-          const dx = accepted ? motion.x / proxy.width : 0, dy = accepted ? motion.y / proxy.height : 0;
-          if (accepted) trackedSamples++;
-          path.push({ t: frames[i].t, x: path[i - 1].x + dx, y: path[i - 1].y + dy });
-        }
-      }
-      const limit = state.mode === 'lock' ? .1 : .075;
+      const limit = state.mode === 'lock' ? .14 : .09;
       state.corrections = path.map((point, i) => {
-        const correction = state.mode === 'lock'
-          ? { x: -smoothPath(path, i, 2).x, y: -smoothPath(path, i, 2).y }
-          : { x: smoothPath(path, i, 7).x - point.x, y: smoothPath(path, i, 7).y - point.y };
-        return { t: point.t, x: Math.max(-limit, Math.min(limit, correction.x)), y: Math.max(-limit, Math.min(limit, correction.y)) };
+        const target = state.mode === 'lock' ? { x: 0, y: 0, angle: 0, logScale: 0 } : smoothPath(path, i, 10);
+        const x = Math.max(-limit, Math.min(limit, target.x - point.x));
+        const y = Math.max(-limit, Math.min(limit, target.y - point.y));
+        const angle = Math.max(-.16, Math.min(.16, target.angle - point.angle));
+        const scale = Math.max(.88, Math.min(1.14, Math.exp(target.logScale - point.logScale)));
+        return { t: point.t, x, y, angle, scale };
       });
-      const maxCorrection = state.corrections.reduce((max, item) => Math.max(max, Math.abs(item.x), Math.abs(item.y)), 0);
-      state.stabilizationScale = Math.max(1.04, Math.min(1.28, 1 + maxCorrection * 2.25));
-      $('#stabilizeText').textContent = `Tracked ${trackedSamples} stable scene samples · ${Math.round((state.stabilizationScale - 1) * 100)}% crop guard.`;
-      await seek(state.trimStart); drawPreview(); toast('Motion analysis complete.');
-    } catch (error) { toast('Motion analysis could not finish in this browser.'); state.mode = 'off'; state.corrections = []; }
-    finally { button.disabled = false; button.textContent = 'Analyze again'; progress.classList.add('hidden'); }
+      const guard = state.corrections.reduce((max, item) => Math.max(max, Math.abs(item.x) * 2.2, Math.abs(item.y) * 2.2, Math.abs(item.angle) * .8, Math.abs(1 - item.scale)), 0);
+      state.stabilizationScale = Math.max(1.05, Math.min(1.35, 1 + guard));
+      const averageInliers = trackedSamples ? Math.round(inlierTotal / trackedSamples) : 0;
+      $('#stabilizeText').textContent = `Similarity tracking: ${trackedSamples} frames · ${averageInliers} RANSAC inliers/frame · ${Math.round((state.stabilizationScale - 1) * 100)}% crop guard.`;
+      await seek(state.trimStart); drawPreview(); toast('Optical-flow stabilization complete.');
+    } catch (error) {
+      console.error(error); toast('Optical-flow analysis failed in this browser.'); state.corrections = []; state.stabilizationScale = 1;
+    } finally {
+      if (previousGray) previousGray.delete();
+      button.disabled = false; button.textContent = 'Analyze again'; progress.classList.add('hidden');
+    }
   }
 
   function outputSpec() {
