@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#f4f1ea">
+  <meta name="description" content="Compose short videos locally in your browser.">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="stylesheet" href="styles.css">
+  <title>Video Composer</title>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#" aria-label="Video Composer home"><span class="mark">VC</span><span>Video Composer</span></a>
+    <div class="local-pill"><span></span> LOCAL ONLY</div>
+  </header>
+
+  <nav class="steps" aria-label="Workflow">
+    <button class="step active" data-step="0"><b>1</b><span>Import</span></button>
+    <i></i><button class="step" data-step="1" disabled><b>2</b><span>Trim</span></button>
+    <i></i><button class="step" data-step="2" disabled><b>3</b><span>Stabilize</span></button>
+    <i></i><button class="step" data-step="3" disabled><b>4</b><span>Reframe</span></button>
+    <i></i><button class="step" data-step="4" disabled><b>5</b><span>Text</span></button>
+    <i></i><button class="step" data-step="5" disabled><b>6</b><span>Export</span></button>
+  </nav>
+
+  <main class="shell">
+    <section class="workspace">
+      <div class="stage" id="stage">
+        <div class="empty-state" id="emptyState">
+          <div class="upload-icon">↗</div>
+          <h1>Your footage stays yours.</h1>
+          <p>Drop a video here or choose one from your device.<br>Nothing is uploaded.</p>
+          <label class="primary-button" for="fileInput">Choose video</label>
+          <input id="fileInput" type="file" accept="video/mp4,video/quicktime,.mp4,.mov" hidden>
+          <small>MP4 or MOV · up to 60 seconds</small>
+        </div>
+        <canvas id="previewCanvas" aria-label="Video preview"></canvas>
+        <video id="sourceVideo" playsinline preload="metadata"></video>
+        <div class="drop-hint" id="dropHint">Drop video to import</div>
+      </div>
+      <div class="transport hidden" id="transport">
+        <button class="play-button" id="playButton" aria-label="Play or pause">▶</button>
+        <input id="scrubber" type="range" min="0" max="1" step="0.01" value="0" aria-label="Playhead">
+        <span id="timeDisplay">00:00 / 00:00</span>
+      </div>
+      <div class="privacy-note"><span>◇</span><div><strong>Private by design</strong><br><small>Every frame is processed on this device.</small></div></div>
+    </section>
+
+    <aside class="panel">
+      <section class="panel-page active" data-page="0">
+        <p class="eyebrow">STEP 1 OF 6</p><h2>Import</h2><p class="lede">Start with a short clip from your camera or photo library.</p>
+        <label class="drop-card" for="fileInput"><b>Choose MP4 or MOV</b><span>Browser-supported formats · max 60 sec</span></label>
+        <div class="file-card hidden" id="fileCard"><div><b id="fileName">—</b><span id="fileMeta">—</span></div><button id="replaceButton">Replace</button></div>
+      </section>
+
+      <section class="panel-page" data-page="1">
+        <p class="eyebrow">STEP 2 OF 6</p><h2>Trim</h2><p class="lede">Keep only the part you want to process.</p>
+        <div class="trim-track"><div id="trimFill"></div><input id="trimStart" type="range" min="0" max="1" step="0.04"><input id="trimEnd" type="range" min="0" max="1" step="0.04" value="1"></div>
+        <div class="time-grid"><label>START<input id="startTime" type="text" inputmode="decimal" value="00:00.00"></label><label>END<input id="endTime" type="text" inputmode="decimal" value="00:00.00"></label></div>
+        <div class="stat-row"><span>Selected duration</span><strong id="selectedDuration">0.0 sec</strong></div>
+      </section>
+
+      <section class="panel-page" data-page="2">
+        <p class="eyebrow">STEP 3 OF 6</p><h2>Stabilize</h2><p class="lede">Reduce camera shake before choosing your crop.</p>
+        <div class="segmented three" id="stabilizeModes"><button class="selected" data-value="off">Off</button><button data-value="stabilize">Stabilize</button><button data-value="lock">Camera Lock</button></div>
+        <div class="info-card"><b id="stabilizeTitle">No stabilization</b><span id="stabilizeText">Original camera movement is preserved.</span><div class="progress hidden" id="analysisProgress"><i></i></div></div>
+        <button class="secondary-button hidden" id="analyzeButton">Analyze selected clip</button>
+        <p class="microcopy">Motion is analyzed from a small proxy. Final transforms are applied to the full-resolution source.</p>
+      </section>
+
+      <section class="panel-page" data-page="3">
+        <p class="eyebrow">STEP 4 OF 6</p><h2>Reframe</h2><p class="lede">Choose an aspect ratio, then drag the video to compose.</p>
+        <div class="ratio-grid" id="ratioGrid"></div>
+        <label class="range-label"><span>Zoom <output id="zoomOutput">100%</output></span><input id="zoomRange" type="range" min="1" max="3" step="0.01" value="1"></label>
+        <button class="secondary-button" id="resetCrop">Reset position &amp; zoom</button>
+      </section>
+
+      <section class="panel-page" data-page="4">
+        <p class="eyebrow">STEP 5 OF 6</p><h2>Text</h2><p class="lede">Add one simple text layer for the full clip.</p>
+        <label class="field-label">TEXT<input id="textInput" type="text" maxlength="80" placeholder="Type something…"></label>
+        <label class="range-label"><span>Size <output id="textSizeOutput">48</output></span><input id="textSize" type="range" min="20" max="120" step="1" value="48"></label>
+        <div class="field-label">COLOR<div class="segmented"><button class="selected" data-color="#ffffff">White</button><button data-color="#111111">Black</button></div></div>
+        <label class="field-label">POSITION<select id="textPosition"><option value="top">Top</option><option value="center">Center</option><option value="bottom" selected>Bottom</option></select></label>
+        <p class="microcopy">You can also drag the text directly on the preview.</p>
+      </section>
+
+      <section class="panel-page" data-page="5">
+        <p class="eyebrow">STEP 6 OF 6</p><h2>Export</h2><p class="lede">Choose a destination. Export runs in real time on this device.</p>
+        <div class="field-label">QUALITY<div class="segmented" id="qualityModes"><button class="selected" data-quality="social">Social 1080p</button><button data-quality="4k">4K High Quality</button></div></div>
+        <label class="field-label">PRESET<select id="presetSelect"><option value="reels">Instagram Reels · 1080×1920</option><option value="feed">Instagram Feed · 1080×1350</option><option value="square">Instagram Square · 1080×1080</option><option value="youtube">YouTube · 1920×1080</option><option value="shorts">YouTube Shorts · 1080×1920</option><option value="current">Current ratio</option></select></label>
+        <div class="field-label">AUDIO<div class="segmented" id="audioModes"><button class="selected" data-audio="keep">Keep Original</button><button data-audio="mute">Mute</button></div></div>
+        <div class="export-summary"><span>OUTPUT</span><strong id="outputSize">1080 × 1920 · 25 fps</strong><small id="exportEstimate">Browser-native export</small></div>
+        <button class="export-button" id="exportButton">Export video <span>→</span></button>
+        <div class="export-progress hidden" id="exportProgress"><div><span id="exportStatus">Preparing…</span><b id="exportPercent">0%</b></div><progress max="100" value="0"></progress><button id="cancelExport">Cancel</button></div>
+        <a class="download-button hidden" id="downloadLink">Download exported video</a>
+        <p class="microcopy" id="compatibilityNote">Output format is chosen from what this browser supports.</p>
+      </section>
+
+      <div class="panel-footer"><button id="backButton" class="back-button" disabled>Back</button><button id="nextButton" class="next-button" disabled>Continue <span>→</span></button></div>
+    </aside>
+  </main>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="app.js" defer></script>
+</body>
+</html>
