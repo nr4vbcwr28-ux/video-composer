@@ -12,7 +12,7 @@
     file: null, url: '', duration: 0, step: 0, trimStart: 0, trimEnd: 0,
     mode: 'off', ratio: 'original', zoom: 1, offsetX: 0, offsetY: 0,
     text: '', textSize: 48, textColor: '#ffffff', textX: .5, textY: .82,
-    quality: 'social', preset: 'reels', audio: 'keep', corrections: [],
+    quality: 'social', preset: 'reels', audio: 'keep', corrections: [], stabilizationScale: 1,
     exporting: false, cancelExport: false, outputUrl: ''
   };
 
@@ -98,7 +98,7 @@
       state.file = null; video.removeAttribute('src'); video.load(); toast(error.message); return;
     }
     state.file = file; state.duration = video.duration; state.trimStart = 0; state.trimEnd = video.duration;
-    state.corrections = []; state.offsetX = 0; state.offsetY = 0; state.zoom = 1;
+    state.corrections = []; state.stabilizationScale = 1; state.offsetX = 0; state.offsetY = 0; state.zoom = 1;
     $('#zoomRange').value = 1; $('#zoomOutput').value = '100%';
     $('#fileName').textContent = file.name;
     $('#fileMeta').textContent = `${video.videoWidth}×${video.videoHeight} · ${formatTime(video.duration)} · ${(file.size / 1048576).toFixed(1)} MB`;
@@ -128,7 +128,7 @@
     let value = Math.max(0, Math.min(state.duration, Number(raw) || 0));
     if (which === 'start') state.trimStart = Math.min(value, state.trimEnd - .2);
     else state.trimEnd = Math.max(value, state.trimStart + .2);
-    state.corrections = []; video.currentTime = which === 'start' ? state.trimStart : state.trimEnd;
+    state.corrections = []; state.stabilizationScale = 1; video.currentTime = which === 'start' ? state.trimStart : state.trimEnd;
     updateTrimUI(); drawPreview();
   }
 
@@ -164,7 +164,7 @@
     let baseW, baseH;
     if (sourceRatio > targetRatio) { baseH = view.h; baseW = baseH * sourceRatio; }
     else { baseW = view.w; baseH = baseW / sourceRatio; }
-    const stabilizationScale = state.mode === 'off' ? 1 : 1.08;
+    const stabilizationScale = state.mode === 'off' ? 1 : state.stabilizationScale;
     const drawW = baseW * state.zoom * stabilizationScale, drawH = baseH * state.zoom * stabilizationScale;
     const maxX = Math.max(0, (drawW - view.w) / 2), maxY = Math.max(0, (drawH - view.h) / 2);
     const motion = correctionAt(video.currentTime);
@@ -197,40 +197,90 @@
   }
   function updateTimeDisplay() { $('#timeDisplay').textContent = `${formatTime(video.currentTime)} / ${formatTime(state.trimEnd)}`; $('#scrubber').value = Math.min(state.trimEnd, Math.max(state.trimStart, video.currentTime || 0)); }
 
+  function edgeMap(data, width, height) {
+    const gray = new Uint8Array(width * height);
+    const edges = new Uint8Array(width * height);
+    for (let i = 0, p = 0; i < data.length; i += 4, p++) gray[p] = Math.round(data[i] * .2126 + data[i + 1] * .7152 + data[i + 2] * .0722);
+    for (let y = 1; y < height; y++) for (let x = 1; x < width; x++) {
+      const i = y * width + x;
+      edges[i] = Math.min(255, Math.abs(gray[i] - gray[i - 1]) + Math.abs(gray[i] - gray[i - width]));
+    }
+    return edges;
+  }
+
+  function estimateTranslation(previous, current, width, height, radius = 7) {
+    let bestScore = Infinity, bestX = 0, bestY = 0, zeroScore = Infinity;
+    const margin = radius + 3;
+    for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
+      let difference = 0, samples = 0;
+      for (let y = margin; y < height - margin; y += 2) {
+        const previousRow = y * width;
+        const currentRow = (y + dy) * width;
+        for (let x = margin; x < width - margin; x += 2) {
+          difference += Math.abs(previous[previousRow + x] - current[currentRow + x + dx]); samples++;
+        }
+      }
+      const score = difference / Math.max(1, samples);
+      if (dx === 0 && dy === 0) zeroScore = score;
+      if (score < bestScore) { bestScore = score; bestX = dx; bestY = dy; }
+    }
+    const improvement = zeroScore > 0 ? (zeroScore - bestScore) / zeroScore : 0;
+    if (improvement < .012 && Math.hypot(bestX, bestY) > 1.5) return { x: 0, y: 0, confidence: 0 };
+    return { x: bestX, y: bestY, confidence: Math.max(0, improvement) };
+  }
+
+  function median(values) {
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  }
+
+  function smoothPath(path, index, radius) {
+    let x = 0, y = 0, weightTotal = 0;
+    for (let i = Math.max(0, index - radius); i <= Math.min(path.length - 1, index + radius); i++) {
+      const distance = Math.abs(i - index);
+      const weight = radius + 1 - distance;
+      x += path[i].x * weight; y += path[i].y * weight; weightTotal += weight;
+    }
+    return { x: x / weightTotal, y: y / weightTotal };
+  }
+
   async function analyzeMotion() {
     if (!state.file || state.mode === 'off') return;
     const button = $('#analyzeButton'), progress = $('#analysisProgress');
     button.disabled = true; button.textContent = 'Analyzing motion…'; progress.classList.remove('hidden'); video.pause();
-    const proxy = document.createElement('canvas'); proxy.width = 96; proxy.height = Math.max(54, Math.round(96 * video.videoHeight / video.videoWidth));
+    const proxy = document.createElement('canvas'); proxy.width = 128; proxy.height = Math.max(72, Math.round(128 * video.videoHeight / video.videoWidth));
     const pctx = proxy.getContext('2d', { willReadFrequently: true });
     const length = state.trimEnd - state.trimStart;
-    const count = Math.max(8, Math.min(90, Math.ceil(length * 2.5)));
-    const points = [];
+    const count = Math.max(10, Math.min(180, Math.ceil(length * 3) + 1));
+    const frames = [], shifts = [];
     try {
       for (let i = 0; i < count; i++) {
         const t = state.trimStart + (length * i / Math.max(1, count - 1));
         await seek(t); pctx.drawImage(video, 0, 0, proxy.width, proxy.height);
-        const data = pctx.getImageData(0, 0, proxy.width, proxy.height).data;
-        let sum = 0, xsum = 0, ysum = 0;
-        for (let y = 2; y < proxy.height - 2; y += 2) for (let x = 2; x < proxy.width - 2; x += 2) {
-          const idx = (y * proxy.width + x) * 4;
-          const luma = data[idx] * .2126 + data[idx + 1] * .7152 + data[idx + 2] * .0722;
-          const left = data[idx - 8] * .2126 + data[idx - 7] * .7152 + data[idx - 6] * .0722;
-          const upIdx = idx - proxy.width * 8;
-          const up = data[upIdx] * .2126 + data[upIdx + 1] * .7152 + data[upIdx + 2] * .0722;
-          const weight = Math.abs(luma - left) + Math.abs(luma - up) + 1;
-          sum += weight; xsum += x * weight; ysum += y * weight;
-        }
-        points.push({ t, x: xsum / sum / proxy.width, y: ysum / sum / proxy.height });
+        const edges = edgeMap(pctx.getImageData(0, 0, proxy.width, proxy.height).data, proxy.width, proxy.height);
+        frames.push({ t, edges });
+        if (frames.length > 1) shifts.push(estimateTranslation(frames[frames.length - 2].edges, edges, proxy.width, proxy.height));
         button.textContent = `Analyzing motion… ${Math.round((i + 1) / count * 100)}%`;
         await wait(0);
       }
-      const radius = state.mode === 'lock' ? points.length : 3;
-      state.corrections = points.map((point, i) => {
-        let sx = 0, sy = 0, n = 0;
-        for (let j = Math.max(0, i - radius); j <= Math.min(points.length - 1, i + radius); j++) { sx += points[j].x; sy += points[j].y; n++; }
-        return { t: point.t, x: Math.max(-.035, Math.min(.035, (sx / n - point.x))), y: Math.max(-.035, Math.min(.035, (sy / n - point.y))) };
+      const filtered = shifts.map((shift, i) => {
+        const local = shifts.slice(Math.max(0, i - 1), Math.min(shifts.length, i + 2));
+        return { x: median(local.map(item => item.x)), y: median(local.map(item => item.y)), confidence: shift.confidence };
       });
+      const path = [{ t: frames[0].t, x: 0, y: 0 }];
+      filtered.forEach((shift, i) => path.push({ t: frames[i + 1].t, x: path[i].x + shift.x / proxy.width, y: path[i].y + shift.y / proxy.height }));
+      const anchorCount = Math.min(4, path.length);
+      const anchor = { x: median(path.slice(0, anchorCount).map(item => item.x)), y: median(path.slice(0, anchorCount).map(item => item.y)) };
+      const limit = state.mode === 'lock' ? .1 : .075;
+      state.corrections = path.map((point, i) => {
+        const target = state.mode === 'lock' ? anchor : smoothPath(path, i, 5);
+        return { t: point.t, x: Math.max(-limit, Math.min(limit, target.x - point.x)), y: Math.max(-limit, Math.min(limit, target.y - point.y)) };
+      });
+      const maxCorrection = state.corrections.reduce((max, item) => Math.max(max, Math.abs(item.x), Math.abs(item.y)), 0);
+      state.stabilizationScale = Math.max(1.04, Math.min(1.28, 1 + maxCorrection * 2.25));
+      const reliable = filtered.filter(item => item.confidence >= .012).length;
+      $('#stabilizeText').textContent = `Tracked ${reliable} motion samples · ${Math.round((state.stabilizationScale - 1) * 100)}% crop guard.`;
       await seek(state.trimStart); drawPreview(); toast('Motion analysis complete.');
     } catch (error) { toast('Motion analysis could not finish in this browser.'); state.mode = 'off'; state.corrections = []; }
     finally { button.disabled = false; button.textContent = 'Analyze again'; progress.classList.add('hidden'); }
@@ -338,7 +388,7 @@
     video.addEventListener('pause', () => { if (!state.exporting) $('#playButton').textContent = '▶'; });
     video.addEventListener('seeked', () => { if (!state.exporting) { drawPreview(); updateTimeDisplay(); } });
     $$('#stabilizeModes button').forEach(button => button.addEventListener('click', () => {
-      state.mode = button.dataset.value; state.corrections = [];
+      state.mode = button.dataset.value; state.corrections = []; state.stabilizationScale = 1;
       $$('#stabilizeModes button').forEach(b => b.classList.toggle('selected', b === button));
       const copy = { off:['No stabilization','Original camera movement is preserved.'], stabilize:['Smooth handheld motion','Gently reduces shake while keeping intentional movement.'], lock:['Camera lock','Holds the frame as steadily as possible.'] }[state.mode];
       $('#stabilizeTitle').textContent = copy[0]; $('#stabilizeText').textContent = copy[1]; $('#analyzeButton').classList.toggle('hidden', state.mode === 'off'); drawPreview();
