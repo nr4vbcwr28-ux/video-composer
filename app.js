@@ -208,31 +208,68 @@
     return edges;
   }
 
-  function estimateTranslation(previous, current, width, height, radius = 7) {
-    let bestScore = Infinity, bestX = 0, bestY = 0, zeroScore = Infinity;
-    const margin = radius + 3;
-    for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
-      let difference = 0, samples = 0;
-      for (let y = margin; y < height - margin; y += 2) {
-        const previousRow = y * width;
-        const currentRow = (y + dy) * width;
-        for (let x = margin; x < width - margin; x += 2) {
-          difference += Math.abs(previous[previousRow + x] - current[currentRow + x + dx]); samples++;
-        }
-      }
-      const score = difference / Math.max(1, samples);
-      if (dx === 0 && dy === 0) zeroScore = score;
-      if (score < bestScore) { bestScore = score; bestX = dx; bestY = dy; }
-    }
-    const improvement = zeroScore > 0 ? (zeroScore - bestScore) / zeroScore : 0;
-    if (improvement < .012 && Math.hypot(bestX, bestY) > 1.5) return { x: 0, y: 0, confidence: 0 };
-    return { x: bestX, y: bestY, confidence: Math.max(0, improvement) };
-  }
-
   function median(values) {
     const sorted = [...values].sort((a, b) => a - b);
     const middle = Math.floor(sorted.length / 2);
     return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  }
+
+  function trackingPoints(edges, width, height, radius, maxPoints = 16) {
+    const patchRadius = 4, margin = radius + patchRadius + 2, candidates = [];
+    for (let y = margin; y < height - margin; y += 7) for (let x = margin; x < width - margin; x += 7) {
+      let score = 0;
+      for (let py = -2; py <= 2; py++) for (let px = -2; px <= 2; px++) score += edges[(y + py) * width + x + px];
+      if (score > 420) candidates.push({ x, y, score });
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    const selected = [];
+    for (const point of candidates) {
+      if (selected.every(other => Math.hypot(point.x - other.x, point.y - other.y) >= 9)) selected.push(point);
+      if (selected.length >= maxPoints) break;
+    }
+    return selected;
+  }
+
+  function matchPoint(previous, current, width, point, radius) {
+    const patchRadius = 4;
+    let bestScore = Infinity, bestX = 0, bestY = 0, zeroScore = Infinity;
+    const scoreAt = (dx, dy) => {
+      let difference = 0;
+      for (let py = -patchRadius; py <= patchRadius; py += 2) {
+        const previousRow = (point.y + py) * width;
+        const currentRow = (point.y + dy + py) * width;
+        for (let px = -patchRadius; px <= patchRadius; px += 2) {
+          difference += Math.abs(previous[previousRow + point.x + px] - current[currentRow + point.x + dx + px]);
+        }
+      }
+      return difference;
+    };
+    zeroScore = scoreAt(0, 0);
+    for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
+      const difference = scoreAt(dx, dy);
+      if (difference < bestScore) { bestScore = difference; bestX = dx; bestY = dy; }
+    }
+    const confidence = zeroScore > 0 ? Math.max(0, (zeroScore - bestScore) / zeroScore) : 0;
+    return { x: bestX, y: bestY, confidence };
+  }
+
+  function estimateTranslation(previous, current, width, height, radius = 12) {
+    const points = trackingPoints(previous, width, height, radius);
+    const matches = points.map(point => matchPoint(previous, current, width, point, radius))
+      .filter(match => match.confidence >= .018 || Math.hypot(match.x, match.y) <= 1.5);
+    if (matches.length < 5) return { x: 0, y: 0, confidence: 0, tracks: matches.length };
+    const centerX = median(matches.map(match => match.x));
+    const centerY = median(matches.map(match => match.y));
+    const deviations = matches.map(match => Math.hypot(match.x - centerX, match.y - centerY));
+    const tolerance = Math.max(1.5, median(deviations) * 2.5);
+    const inliers = matches.filter(match => Math.hypot(match.x - centerX, match.y - centerY) <= tolerance);
+    if (inliers.length < 4) return { x: 0, y: 0, confidence: 0, tracks: inliers.length };
+    return {
+      x: median(inliers.map(match => match.x)),
+      y: median(inliers.map(match => match.y)),
+      confidence: median(inliers.map(match => match.confidence)),
+      tracks: inliers.length
+    };
   }
 
   function smoothPath(path, index, radius) {
@@ -249,38 +286,51 @@
     if (!state.file || state.mode === 'off') return;
     const button = $('#analyzeButton'), progress = $('#analysisProgress');
     button.disabled = true; button.textContent = 'Analyzing motion…'; progress.classList.remove('hidden'); video.pause();
-    const proxy = document.createElement('canvas'); proxy.width = 128; proxy.height = Math.max(72, Math.round(128 * video.videoHeight / video.videoWidth));
+    const proxy = document.createElement('canvas'); proxy.width = 192; proxy.height = Math.max(108, Math.round(192 * video.videoHeight / video.videoWidth));
     const pctx = proxy.getContext('2d', { willReadFrequently: true });
     const length = state.trimEnd - state.trimStart;
-    const count = Math.max(10, Math.min(180, Math.ceil(length * 3) + 1));
-    const frames = [], shifts = [];
+    const count = Math.max(12, Math.min(240, Math.ceil(length * 5) + 1));
+    const frames = [];
     try {
       for (let i = 0; i < count; i++) {
         const t = state.trimStart + (length * i / Math.max(1, count - 1));
         await seek(t); pctx.drawImage(video, 0, 0, proxy.width, proxy.height);
         const edges = edgeMap(pctx.getImageData(0, 0, proxy.width, proxy.height).data, proxy.width, proxy.height);
         frames.push({ t, edges });
-        if (frames.length > 1) shifts.push(estimateTranslation(frames[frames.length - 2].edges, edges, proxy.width, proxy.height));
         button.textContent = `Analyzing motion… ${Math.round((i + 1) / count * 100)}%`;
         await wait(0);
       }
-      const filtered = shifts.map((shift, i) => {
-        const local = shifts.slice(Math.max(0, i - 1), Math.min(shifts.length, i + 2));
-        return { x: median(local.map(item => item.x)), y: median(local.map(item => item.y)), confidence: shift.confidence };
-      });
+      let trackedSamples = 0;
       const path = [{ t: frames[0].t, x: 0, y: 0 }];
-      filtered.forEach((shift, i) => path.push({ t: frames[i + 1].t, x: path[i].x + shift.x / proxy.width, y: path[i].y + shift.y / proxy.height }));
-      const anchorCount = Math.min(4, path.length);
-      const anchor = { x: median(path.slice(0, anchorCount).map(item => item.x)), y: median(path.slice(0, anchorCount).map(item => item.y)) };
+      if (state.mode === 'lock') {
+        let lastGood = { x: 0, y: 0 };
+        for (let i = 1; i < frames.length; i++) {
+          const motion = estimateTranslation(frames[0].edges, frames[i].edges, proxy.width, proxy.height, 26);
+          if (motion.tracks >= 5 && (motion.confidence >= .01 || Math.hypot(motion.x, motion.y) <= 1.5)) {
+            lastGood = { x: motion.x / proxy.width, y: motion.y / proxy.height };
+            trackedSamples++;
+          }
+          path.push({ t: frames[i].t, ...lastGood });
+        }
+      } else {
+        for (let i = 1; i < frames.length; i++) {
+          const motion = estimateTranslation(frames[i - 1].edges, frames[i].edges, proxy.width, proxy.height, 12);
+          const accepted = motion.tracks >= 5 && (motion.confidence >= .01 || Math.hypot(motion.x, motion.y) <= 1.5);
+          const dx = accepted ? motion.x / proxy.width : 0, dy = accepted ? motion.y / proxy.height : 0;
+          if (accepted) trackedSamples++;
+          path.push({ t: frames[i].t, x: path[i - 1].x + dx, y: path[i - 1].y + dy });
+        }
+      }
       const limit = state.mode === 'lock' ? .1 : .075;
       state.corrections = path.map((point, i) => {
-        const target = state.mode === 'lock' ? anchor : smoothPath(path, i, 5);
-        return { t: point.t, x: Math.max(-limit, Math.min(limit, target.x - point.x)), y: Math.max(-limit, Math.min(limit, target.y - point.y)) };
+        const correction = state.mode === 'lock'
+          ? { x: -smoothPath(path, i, 2).x, y: -smoothPath(path, i, 2).y }
+          : { x: smoothPath(path, i, 7).x - point.x, y: smoothPath(path, i, 7).y - point.y };
+        return { t: point.t, x: Math.max(-limit, Math.min(limit, correction.x)), y: Math.max(-limit, Math.min(limit, correction.y)) };
       });
       const maxCorrection = state.corrections.reduce((max, item) => Math.max(max, Math.abs(item.x), Math.abs(item.y)), 0);
       state.stabilizationScale = Math.max(1.04, Math.min(1.28, 1 + maxCorrection * 2.25));
-      const reliable = filtered.filter(item => item.confidence >= .012).length;
-      $('#stabilizeText').textContent = `Tracked ${reliable} motion samples · ${Math.round((state.stabilizationScale - 1) * 100)}% crop guard.`;
+      $('#stabilizeText').textContent = `Tracked ${trackedSamples} stable scene samples · ${Math.round((state.stabilizationScale - 1) * 100)}% crop guard.`;
       await seek(state.trimStart); drawPreview(); toast('Motion analysis complete.');
     } catch (error) { toast('Motion analysis could not finish in this browser.'); state.mode = 'off'; state.corrections = []; }
     finally { button.disabled = false; button.textContent = 'Analyze again'; progress.classList.add('hidden'); }
